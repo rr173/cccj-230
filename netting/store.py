@@ -87,6 +87,24 @@ CREATE TABLE IF NOT EXISTS apply_log (
     detail       TEXT NOT NULL,
     attempted_at TEXT NOT NULL
 );
+
+-- Write-boundary marker for downstream local handoff consumers (the posting
+-- package shares this database file).  One row is inserted inside the same
+-- transaction as an application that actually rewrites fact rows, recording
+-- how many physical fact rows that application removed and inserted.  An
+-- idempotent same-revision retry and a rejected application never reach the
+-- rewrite path, so they get no row; a revision-only change whose pairings and
+-- amounts are identical still gets a row with equal delete/insert counts, and
+-- consumers compact the paired rows to a no-op.  This table never feeds back
+-- into any netting decision, so netting semantics are unchanged.
+CREATE TABLE IF NOT EXISTS fact_revisions (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    business_day   TEXT NOT NULL,
+    revision       INTEGER NOT NULL,
+    facts_deleted  INTEGER NOT NULL,
+    facts_inserted INTEGER NOT NULL,
+    recorded_at    TEXT NOT NULL
+);
 """
 
 
@@ -366,6 +384,31 @@ class NettingStore:
                VALUES(?, ?, ?, ?, ?)""",
             (business_day, revision, outcome, detail, now),
         )
+
+    def record_fact_revision(
+        self, business_day: str, revision: int, facts_deleted: int,
+        facts_inserted: int, now: str,
+    ) -> None:
+        """Mark one application transaction that rewrote fact rows.
+
+        Runs inside the application's own transaction, so it commits and rolls
+        back together with the rewritten facts.  Downstream posting consumes
+        these markers to delimit application boundaries without scanning
+        historical pairings.
+        """
+        self.conn.execute(
+            """INSERT INTO fact_revisions(business_day, revision,
+                                          facts_deleted, facts_inserted,
+                                          recorded_at)
+               VALUES(?, ?, ?, ?, ?)""",
+            (business_day, revision, facts_deleted, facts_inserted, now),
+        )
+
+    def latest_fact_revision_id(self) -> int:
+        row = self.conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS m FROM fact_revisions"
+        ).fetchone()
+        return int(row["m"])
 
     def list_attempts(self, business_day: Optional[str] = None) -> List[Dict[str, Any]]:
         if business_day is None:

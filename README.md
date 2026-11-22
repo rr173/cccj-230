@@ -50,13 +50,19 @@ netting/           逐笔核销事实表（只读闭合绑定，独立 SQLite �
   engine.py        纯账户内配对引擎：过期、部分抵扣、entry_id 次序、重放
   csv_detail.py    detail.csv 严格校验（UTF-8、表头、ID/kind/金额、日内唯一）
   source.py        按指定 (business_date, revision) 只读 CLOSED 绑定的 detail.csv
-  store.py         独立 SQLite：选版、日快照、检查点、事实表、审计日志（WAL）
+  store.py         独立 SQLite：选版、日快照、检查点、事实表、事实修订边界标记、审计日志（WAL）
   service.py       应用指定版本、受影响账户增量重算、事实读取、全量重放核对
   cli.py           独立进程入口（python -I netting/cli.py --args args.json）
   errors.py        核销侧异常类型
-tests/             合同/场景/流式/真实多进程/核销测试
+posting/           核销过账交接（与核销库同一 SQLite 文件，见第 11 节）
+  store.py         交接表、facts 变更触发器、批次/流水/预览/在途正向流水（WAL）
+  service.py       预览、确认（作废判定/幂等）、按批次号读取、首次启用引导
+  cli.py           独立进程入口（python -I posting/cli.py --args args.json）
+  errors.py        交接侧异常类型
+tests/             合同/场景/流式/真实多进程/核销/过账测试
 demo.py            全流程演示
 netting_demo.py    核销事实表端到端演示（回填、更正、坏版隔离、前缀/旁路）
+posting_demo.py    过账交接端到端演示（冲回/新登记、预览作废、幂等、不扫历史）
 smoke_test.py      冒烟脚本
 ```
 
@@ -225,7 +231,9 @@ SQLite 库与 blob 目录，覆盖：并发接收串行化、未闭合不可领�
 
 独立 SQLite 库（WAL、`synchronous=FULL`、写连接 `BEGIN IMMEDIATE`）含：
 `applied_days`（每选用版）、`entries`（不可变逐日快照）、`facts`（事实表）、
-`checkpoints`（可恢复未清状态）、`apply_log`（含拒绝的审计）。写连接负责事务内
+`checkpoints`（可恢复未清状态）、`apply_log`（含拒绝的审计）、
+`fact_revisions`（每次真正重写事实的应用边界标记，供本地过账交接使用，
+不参与任何核销决策）。写连接负责事务内
 读写（能见到本事务未提交改动），另开只读连接服务已发布查询（不长期钉住 WAL
 读位点）。一次应用是单事务：并发应用串行化、旧版压不回新版、不会丢掉另一日已
 提交变更，读者不可能看到“新版号配旧事实”。重开库即可继续查询与更新。
@@ -284,4 +292,108 @@ python3 -I tests/test_netting_multiprocess.py  # 真实多进程并发与读者�
 | 重开库可查询并继续更新 | `test_reopen_database_preserves_and_continues_state` |
 | 并发不同日互不丢变更、竞态下旧版压不回、读者一致性 | `test_netting_multiprocess.py` 三个用例 |
 | 到账两日窗口、到期不撤销已核销、ASCII 次序、累计不超额 | `test_netting_engine.py` |
+
+## 11. 核销过账交接（`posting/`）
+
+在核销库之上做**本地**过账交接：财务先预览一批应交付流水，再确认发布；
+发布后的批次按批次号反复读取。它不连接任何外部总账、不改任何核销配对规则，
+所有表与触发器都建在核销库**同一个 SQLite 文件**里，因此一次核销应用与其
+变更记录、一次批次确认与其流水/水位都在同一事务内原子提交。
+
+### 11.1 配对标识与流水语义
+
+配对标识为「账户 + 核销业务日 + 账单事件身份 + 到账事件身份」，事件身份是
+「原业务日 + `entry_id`」；金额一律整数分，数据库 rowid 不是业务身份。
+预览比较当前核销事实与上次交接结果：
+
+* 新出现的配对 → 正向流水（`forward`）；
+* 消失的配对 → 全额冲回（`reversal`），冲回行显式指向仍有效的那条正向
+  流水编号（外键保证目标存在且未被冲过，不能指向已冲销版本）；
+* 同一配对金额变化 → 先全额冲回旧金额、再登记新金额，**不记净差**；
+* 配对移到另一核销日或换掉任一事件身份 → 按旧配对消失 + 新配对出现处理，
+  即使合计金额不变；
+* 两次交接之间出现又消失、最终没有留下变化的配对 → 不出流水。
+
+过账日独立于核销业务日：可与上一批相同，但不得早于上一批的过账日；更正
+登记在本次过账日上，每条流水仍保留原配对的业务日期。
+
+### 11.2 增量边界与「业务变更」判定（不扫历史）
+
+`posting` 在核销 `facts` 表上挂两个只追加的触发器，把每次物理删/插逐行
+写入 `fact_change_log`；核销服务在每个真正重写事实的应用事务内写一条
+`fact_revisions` 边界标记（同版重试与被拒绝的应用走不到重写路径，没有
+标记）。每个标记的变更行按多重集差分化简：
+
+* 完全相同的「删除 + 插入」两两抵消（只重写数据库行、配对与金额没变，
+  即便修订号变了）→ 业务变更时钟 `fact_clock` **不动**，预览不作废；
+* 有非空差分的应用（新配对/消失/改金额）→ 时钟 +1；每个应用单独评估，
+  所以「改了又改回」仍是两次业务变更，夹在预览与确认之间照样作废旧预览；
+* 失败应用整体回滚，触发器副作用一起回滚，时钟不动。
+
+除首次启用的一次性引导外，预览/确认只读 `fact_change_log` 中超过水位的
+行，并对涉及身份做索引点查，从不扫描未受本轮变化影响的历史配对或已发布
+流水；按批次号读取不受此限。首次启用可直接在已有核销库上从现存事实建立
+初始待交接集合，无需重新导入原文件。
+
+### 11.3 预览/确认协议与并发
+
+* 预览只追加 `posting_previews` 行，不移动任何交接水位；没有待交接流水时
+  抛 `NothingToPost`，绝不发布空批。
+* 确认只能发布该预览的内容。确认时若时钟较预览基址变化（任何一次真正
+  改变事实的应用，即使随后改回），或已有另一个预览先确认（批次号基址
+  变化），该预览作废（标记 `superseded`）并抛 `PreviewStale`，提示重新
+  预览；纯行重写、仅修订号变化、失败应用都不会作废预览。
+* 已确认预览的重试幂等：返回同一批次、同一批流水号，不再写任何流水；
+  之后的更正不影响它，只属于下一批。
+* 批次号稳定递增，批内 `entry_no` 稳定，同一配对的冲回恒在新登记之前；
+  批次一经确认不可改写，读者只看见整批已确认流水，并能凭冲回行追溯原
+  正向流水与原配对身份。
+* WAL + 写连接 `BEGIN IMMEDIATE` 串行化并发应用与确认：旧预览不会被当成
+  新结果发布，并发确认只有一个赢家、不会重复出账。关闭进程重开后已发布
+  批次可读、未确认预览仍按同一规则确认或拒绝。
+
+### 11.4 接口与示例
+
+```python
+from netting import NettingService
+from posting import PostingService, PreviewStale, NothingToPost
+
+# 与核销库同一个 SQLite 文件；首次打开即在现存事实上完成引导准备
+net = NettingService("/path/to/netting.db", closure=closure_service)
+post = PostingService("/path/to/netting.db")
+
+preview = post.preview(posting_day="2026-11-03")   # 不改交接状态
+# preview["entries"]: forward/reversal 行，reversal 带 reverses_flow_id
+batch = post.confirm(preview["preview_id"])        # 发布不可变批次
+post.read_batch(batch["batch_no"])                 # 按批次号反复读取
+post.list_batches()                                # 批次头列表
+post.handoff_state()                               # 交接水位/时钟快照
+```
+
+命令行（参数走 JSON 文件，便于多进程/调度器）：
+
+```bash
+python3 -I posting/cli.py --args preview.json      # preview/confirm/read_batch/
+python3 -I posting/cli.py --args confirm.json      # batches/state
+```
+
+### 11.5 演示与测试
+
+```bash
+python3 -I posting_demo.py                  # 60/40→30/70、先改后交接、预览作废、
+                                            # 重试幂等、无关历史不扫描
+python3 -I tests/test_posting_service.py    # 17 个用例（含真实多进程并发）
+```
+
+| 场景 | 测试 |
+| --- | --- |
+| 总额不变的 30/70 更正仍交付两冲回两新登记，冲回指向原流水 | `test_equal_total_correction_delivers_two_reversals_and_two_forwards` |
+| 先改再首次交接只登记当前两笔 | `test_correction_before_first_handoff_registers_current_pairings_only` |
+| 更正夹在预览/确认之间（含改回）→ 旧预览拒绝、重预览正确、重试不重复写 | `test_correction_between_preview_and_confirm_rejects_then_repreview` |
+| 无关历史配对不被后续交接扫描 | `test_unrelated_history_is_not_scanned_on_later_handoffs` |
+| 消失全额冲回、身份/核销日迁移按消失+出现处理、闪烁不留痕 | `DeltaSemanticsTests` |
+| 纯行重写/失败应用/同版重试不作废预览 | `test_row_only_rewrite_and_failed_application_do_not_stale_preview` |
+| 过账日次序、空批不发布、重开恢复、现存库引导 | `ProtocolTests` |
+| 并发确认唯一赢家、跨进程应用与确认不发布旧事实 | `ConcurrencyTests` |
+
 

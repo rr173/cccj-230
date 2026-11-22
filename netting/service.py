@@ -135,14 +135,24 @@ class NettingService:
                     }
 
                 affected = self._collect_affected_accounts(day, entries)
+                # Application boundary marker for the local posting handoff:
+                # capture the change-log window inside the same transaction so
+                # the consumer can tell a genuine business change apart from a
+                # same-pairing row rewrite, without re-diffing history.
+                change_start = self._current_change_seq()
                 deleted, inserted = self._install_revision(
                     day, revision, detail, entries, affected, now
+                )
+                change_end = self._current_change_seq()
+                self.store.record_fact_revision(
+                    day, revision, deleted, inserted, now
                 )
                 self.store.record_attempt(
                     day, revision, "applied",
                     f"selected revision {revision}; accounts="
                     f"{sorted(affected)}; deleted={deleted}; "
-                    f"inserted={inserted}",
+                    f"inserted={inserted}; change_seq="
+                    f"{change_start}..{change_end}",
                     now,
                 )
                 self.store.commit()
@@ -161,6 +171,23 @@ class NettingService:
             # Published state is untouched; persist the rejection as an
             # independent audit row (its own short transaction).
             self._record_rejection(day, revision, now)
+            raise
+
+    def _current_change_seq(self) -> int:
+        """High-water mark of the posting change log, or 0 if not installed.
+
+        The posting package may not have been enabled yet on this database;
+        its tables are optional for netting itself, so a missing table is
+        treated as zero instead of failing the application.
+        """
+        try:
+            row = self.store.conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) AS m FROM fact_change_log"
+            ).fetchone()
+            return int(row["m"])
+        except Exception as exc:  # pragma: no cover - exercised without posting
+            if "no such table" in str(exc).lower():
+                return 0
             raise
 
     def _record_rejection(self, day: str, revision: int, now: str) -> None:
