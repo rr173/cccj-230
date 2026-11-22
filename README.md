@@ -46,8 +46,17 @@ batch_closure/
   evidence.py      证据包独立校验器（blob 重哈希、哈希链、合同摘要重导）
   cli.py           独立进程驱动入口（python -I cli.py --args args.json）
   errors.py        异常类型
-tests/             合同/场景/流式/真实多进程测试
+netting/           逐笔核销事实表（只读闭合绑定，独立 SQLite 库，见第 9 节）
+  engine.py        纯账户内配对引擎：过期、部分抵扣、entry_id 次序、重放
+  csv_detail.py    detail.csv 严格校验（UTF-8、表头、ID/kind/金额、日内唯一）
+  source.py        按指定 (business_date, revision) 只读 CLOSED 绑定的 detail.csv
+  store.py         独立 SQLite：选版、日快照、检查点、事实表、审计日志（WAL）
+  service.py       应用指定版本、受影响账户增量重算、事实读取、全量重放核对
+  cli.py           独立进程入口（python -I netting/cli.py --args args.json）
+  errors.py        核销侧异常类型
+tests/             合同/场景/流式/真实多进程/核销测试
 demo.py            全流程演示
+netting_demo.py    核销事实表端到端演示（回填、更正、坏版隔离、前缀/旁路）
 smoke_test.py      冒烟脚本
 ```
 
@@ -165,3 +174,114 @@ SQLite 库与 blob 目录，覆盖：并发接收串行化、未闭合不可领�
 | 摘要成员驱动摘要校验 | `test_summary_member_drives_digest_verification` |
 | 证据自校验与篡改检出 | `test_evidence_bundle_is_self_verifying` / `..._tampering` |
 | 进程退出恢复 | `test_recovery_after_reopen_preserves_decisions` / 多进程崩溃测试 |
+
+## 9. 逐笔核销事实表（`netting/`）
+
+在闭合服务之上维护一张可持续更新、可更正的逐笔核销事实表。它**只读**闭合
+库与内容寻址 blob，绝不修改原闭合库、到货文件或领取状态；全部自有状态写入
+一个独立的持久 SQLite 库。
+
+### 9.1 取数约定（不猜版本、不找同名文件）
+
+每次应用都由调用方明确给出业务日和修订号：
+
+1. 用闭合服务同一套批次身份函数解析该合同下该 `business_date` 的批次；
+2. 只读取该批次**指定修订号**、状态恰为 `CLOSED` 的闭合行（`CLOSED_PARTIAL`、
+   不存在的修订号一律拒绝）；
+3. 从该行的**绑定摘要**取 `detail.csv` 的 blob sha256，再读内容寻址 blob 并
+   重新哈希校验；不去到货目录找同名文件，也不默认读最新版；
+4. 绑定为压缩 payload（如 gzip）或 blob 缺失/哈希不符时拒绝应用。
+
+明细只接受未压缩 UTF-8 CSV，表头固定为 `entry_id,account_id,kind,cents`；
+日内 `entry_id` 唯一，两个 ID 为非空 ASCII 字母数字串，`kind` 仅 `bill`/
+`payment`，`cents` 为不超过 10^12 的正整数。只有表头表示当天无记录，不代表
+文件缺失。任何不符都在写库**之前**拒绝，已发布结果不变。事件身份为
+`业务日 + entry_id`，行序不代表处理顺序。
+
+### 9.2 核销规则
+
+* 只在同一 `account_id` 内核销，允许部分抵扣；单笔累计核销不超过原金额。
+* 按业务日推进，每日顺序：先丢弃已过期的未用到账余额 → 纳入当天两类记录 →
+  从最早未清账单与最早可用到账开始配对。
+* 到账可用于到账日至其后两个自然日（含两端），也可抵更早的欠款；余额过期
+  不撤销已完成的核销，未清账单不过期。
+* 同日先后按各自 `entry_id` 的 ASCII 顺序，绝不使用 CSV 物理行序。
+* 事实表保存每次配对的账户、核销日、账单事件身份、到账事件身份与抵扣金额（分）。
+
+### 9.3 更正安全性（核心）
+
+各日可任意次序加入。同一天新版应用成功后旧版不能回压（抛 `StaleRevision`），
+同版重试幂等不产生重复。对日期 D 的每次应用，结果与“把所有已选日版本从头按
+日期重算”一致，但只重算 D 日行级增删改**实际涉及的账户**（账户迁移算旧、新
+两边；快照逐字节相同的旁路账户完全不触碰），且：
+
+* 从该账户 D 日之前**最新的未清状态检查点**恢复，绝不重放 D 日以前的配对；
+* 只重放已持久化的逐日快照，不重新打开闭合服务、不遍历其他日期的源文件；
+* 只删除并重写该账户 `match_day >= D` 的事实与检查点，未受影响账户的事实
+  连 rowid 都不变；
+* 被删账单的旧配对消失，原来占用的到账按规则改抵之后的账单（见演示第 2 节）。
+
+### 9.4 持久化与并发
+
+独立 SQLite 库（WAL、`synchronous=FULL`、写连接 `BEGIN IMMEDIATE`）含：
+`applied_days`（每选用版）、`entries`（不可变逐日快照）、`facts`（事实表）、
+`checkpoints`（可恢复未清状态）、`apply_log`（含拒绝的审计）。写连接负责事务内
+读写（能见到本事务未提交改动），另开只读连接服务已发布查询（不长期钉住 WAL
+读位点）。一次应用是单事务：并发应用串行化、旧版压不回新版、不会丢掉另一日已
+提交变更，读者不可能看到“新版号配旧事实”。重开库即可继续查询与更新。
+
+### 9.5 接口与示例
+
+```python
+from netting import NettingService
+
+# 复用已打开的闭合服务句柄，或传 closure_data_dir 让其自建只读句柄
+net = NettingService("/path/to/netting.db", closure=closure_service)
+
+# 明确指定业务日 + 修订号；坏绑定/坏 CSV/旧版会抛 netting.errors.* 且不改已发布结果
+net.apply_revision(business_day="2026-11-03", revision=2,
+                   contract_id="daily-settle", contract_version="1")
+
+net.read_facts()                          # 全部事实（含 bill_event/payment_event）
+net.read_facts(account_id="A")           # 按账户过滤
+net.read_facts(business_day="2026-11-03")  # 按核销日过滤
+net.selected_revisions()                 # 各业务日当前选用的修订号
+net.application_log()                    # 应用/幂等/拒绝审计
+net.full_replay()                        # 独立全量重放，用于核对增量结果
+net.open_state_checkpoint("A", "2026-11-03")  # 查看可恢复未清状态
+```
+
+命令行（参数走 JSON 文件，适合多进程/调度器）：
+
+```bash
+python3 -I netting/cli.py --args apply.json     # apply / read / revisions / log / replay
+```
+
+## 10. 核销演示与测试
+
+```bash
+python3 -I netting_demo.py                 # 回填→更正→坏版隔离→前缀/旁路 全流程
+python3 -I tests/test_netting_engine.py   # 纯引擎：部分抵扣/到期/次序/累计上限
+python3 -I tests/test_netting_csv.py      # detail.csv 全部合法性校验
+python3 -I tests/test_netting_service.py  # 更正重定向、删账单、账户迁移、重开恢复
+python3 -I tests/test_netting_multiprocess.py  # 真实多进程并发与读者一致性
+```
+
+测试数据全部运行时通过闭合服务临时生成（临时目录），不提交大型数据文件。
+
+### 10.1 核销场景与需求对照
+
+| 场景 | 测试 |
+| --- | --- |
+| 后导入的账先入、再补前面日批次，结果同从头重算 | `test_out_of_order_apply_matches_from_scratch_replay` |
+| 跨日部分抵扣、到账到期、删账单旧配对消失、到账改抵后续账单 | `test_correction_redirects_payment_and_drops_deleted_bill_facts` |
+| 表头-only 修订删除整日及其配对 | `test_header_only_correction_deletes_whole_day_and_its_pairings` |
+| 账户迁移旧、新两边都重算 | `test_account_move_recomputes_both_old_and_new_account` |
+| 同版重试幂等、旧版不能回压新版 | `test_same_revision_retry_is_idempotent_and_older_revision_rejected` |
+| 坏修订（未知修订/未闭合/坏 CSV/压缩/坏日期）不改已发布结果 | `test_bad_revisions_do_not_change_published_results` |
+| `CLOSED_PARTIAL` 绑定被拒绝 | `test_closed_partial_revision_is_rejected` |
+| 长旧前缀不重放、旁路账户事实不重写 | `test_old_prefix_is_not_replayed_and_bypass_account_is_untouched` |
+| 重开库可查询并继续更新 | `test_reopen_database_preserves_and_continues_state` |
+| 并发不同日互不丢变更、竞态下旧版压不回、读者一致性 | `test_netting_multiprocess.py` 三个用例 |
+| 到账两日窗口、到期不撤销已核销、ASCII 次序、累计不超额 | `test_netting_engine.py` |
+
