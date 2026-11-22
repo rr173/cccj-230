@@ -59,10 +59,18 @@ posting/           核销过账交接（与核销库同一 SQLite 文件，见�
   service.py       预览、确认（作废判定/幂等）、按批次号读取、首次启用引导
   cli.py           独立进程入口（python -I posting/cli.py --args args.json）
   errors.py        交接侧异常类型
-tests/             合同/场景/流式/真实多进程/核销/过账测试
+reconciliation/    总账回执本地对账（过账库只读，回执独立 SQLite 库，见第 12 节）
+  posting_reader.py 固定过账库的只读点查（mode=ro，绝不写入）
+  store.py         回执库：当前版本行 + 只追加导入审计（WAL）
+  validation.py    回执文档严格校验与同版幂等签名
+  service.py       版本纪律导入、按批次对账、冲销原流水跨批次关账判定
+  cli.py           独立进程入口（python -I reconciliation/cli.py --args args.json）
+  errors.py        对账侧异常类型
+tests/             合同/场景/流式/真实多进程/核销/过账/回执对账测试
 demo.py            全流程演示
 netting_demo.py    核销事实表端到端演示（回填、更正、坏版隔离、前缀/旁路）
 posting_demo.py    过账交接端到端演示（冲回/新登记、预览作废、幂等、不扫历史）
+reconciliation_demo.py 回执对账端到端演示（45+75、改挂、净额错记、坏更正隔离）
 smoke_test.py      冒烟脚本
 ```
 
@@ -395,5 +403,94 @@ python3 -I tests/test_posting_service.py    # 17 个用例（含真实多进程�
 | 纯行重写/失败应用/同版重试不作废预览 | `test_row_only_rewrite_and_failed_application_do_not_stale_preview` |
 | 过账日次序、空批不发布、重开恢复、现存库引导 | `ProtocolTests` |
 | 并发确认唯一赢家、跨进程应用与确认不发布旧事实 | `ConcurrencyTests` |
+
+## 12. 总账回执对账（`reconciliation/`）
+
+月末关账前，财务按过账批次核对本地已发布流水在总账里是否真的记齐。
+总账按**凭证组**发回记账明细（一份文件是该组的完整新版本），本模块把回执
+持久化在**独立 SQLite 文件**里，对固定本地过账库（核销+过账同一 SQLite
+文件）只以 `mode=ro` 只读打开：不向总账写数据、不改任何已发布批次、不
+再生成过账流水，也不要求迁移旧库或提供联网接口。
+
+### 12.1 回执文档与版本纪律
+
+UTF-8 JSON，顶层恰为 `receipt_id`、正整数 `revision`、`lines`；每行恰为
+组内唯一的 `line_id`、本地 `flow_id`（非空 ASCII 字母数字串）与非零整数
+`signed_cents`。规则：
+
+* 只接收引用**已确认流水**的回执；同一库内多个组或多行可引用同一流水。
+* 非法行（形状/类型/ID 字符/行内重复/零金额）或未知流水 → 整组不生效，
+  已生效版本不变，拒绝事件写入只追加审计日志。
+* 每份文件是该组完整新版本：行可消失、可改挂别的流水；`lines: []` 表示
+  撤回整组（组记录保留在新版本号、贡献行清零）。
+* 首版不必从 1 开始；只有**更高版本**能整组替换；同版重送在每个
+  `line_id` 的流水与金额都不变时成功（忽略行顺序，不重复计入），内容
+  不同或更低版本一律拒绝（`StaleRevision`）。
+* 可查询的回执行物理上只存当前版本：替换在单事务内先删后插，结构上杜绝
+  一个组新旧版本贡献混用；更正后重查任一相关批次立即反映新版本。
+
+### 12.2 对账规则（按流水编号）
+
+* 应记金额取本地流水：正向为正、冲销为负（冲销行显式指向原正向流水
+  `reverses_flow_id`，外键保证目标存在且未被冲过）。
+* 每条差异流水列出应记金额、**同向**与**反向**实收金额（绝对值合计，
+  正负错记不按净额相抵），以及参与计算的当前凭证组、版本、行号。
+* 仅当同向金额恰好等于应记绝对值且反向金额为 0，该流水才算金额对平；
+  因此 `+130` 与 `-10` 对应记 `+120` 即使净额相等也不对平。
+* 冲销即使自身已对平，只要它明确引用的原正向流水尚未金额对平，仍阻止
+  其所在批次关账，并输出阻止原因与原流水编号；按原编号检查，同一核销
+  配对后来另有正向登记不改变检查目标。
+* 批内每条流水都满足条件才可关账；没有回执的流水不默认成功；不存在的
+  批次直接报错，绝不视为可关账。
+
+### 12.3 读取范围、并发与持久化
+
+* 导入只点查该组新/旧行涉及的流水是否存在，不扫描无关历史回执或本地
+  流水；按批次查询只读取所查批次的流水、冲销显式引用的原流水（可跨
+  批次），以及这些流水在回执库中的索引点查贡献。
+* WAL + `synchronous=FULL` + 写连接 `BEGIN IMMEDIATE`：并发导入不同组
+  串行化且互不丢失，落后版本无法覆盖新版；读者不会看到半替换状态。
+* 全部状态在独立回执 SQLite 文件中，重开进程即可继续查询与更新；导入
+  尝试（含拒绝）均有 `receipt_import_log` 审计。
+
+### 12.4 接口与命令行
+
+```python
+from reconciliation import ReconciliationService
+
+svc = ReconciliationService("/path/to/netting.db",  # 过账库，只读
+                            "/path/to/receipts.db")  # 回执独立持久化
+svc.import_receipt_file("voucher_grp_7.json")   # 或 import_receipt(dict)
+svc.batch_status(2)                             # 关账判断与逐流水差异
+svc.list_groups() / svc.get_group("VGRP75")     # 当前有效版本
+svc.import_log()                                # 接收/幂等/拒绝审计
+```
+
+命令行（参数走 JSON 文件，适合多进程/调度器）：
+
+```bash
+python3 -I reconciliation/cli.py --args import.json   # import/batch/groups/
+python3 -I reconciliation/cli.py --args batch.json    # group/log；batch
+                                                      # 支持 format=text
+```
+
+退出码：0 成功，2 用法/环境错误，3 业务拒绝（`MalformedReceipt` /
+`StaleRevision` / `BatchNotFound`）。
+
+### 12.5 演示与测试
+
+```bash
+python3 -I reconciliation_demo.py                 # 题目四问全流程
+python3 -I tests/test_reconciliation_validation.py       # 回执合法性（15 例）
+python3 -I tests/test_reconciliation_service.py          # 对账规则（28 例）
+python3 -I tests/test_reconciliation_multiprocess.py     # 真实多进程并发/CLI
+```
+
+演示现场生成过账库，依次验证：120 分正向由两个凭证组各记 45/75、另一批次
+-120 冲销足额 → 两批可关账；75 分凭证改挂别的流水后两批均不可关账（冲销
+实收仍为 -120 但原正向未对平）；应记 120 收到 +130/-10 净额相等也不对平；
+带未知流水的更正整组拒绝且旧凭证继续有效；另覆盖同版幂等、低版拒绝、
+空数组撤回、重启持久化与两库文件隔离。
+
 
 
